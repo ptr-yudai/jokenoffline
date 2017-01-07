@@ -1,5 +1,5 @@
 /*
-	wallhack01.cpp
+	wallhack02.cpp
 
 	- Visual C++でコンパイルする必要があります
 	- Direct3D(d3dx9)が必要です
