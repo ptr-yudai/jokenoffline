@@ -500,9 +500,8 @@ VOID WINAPI my_DrawIndexedPrimitive(LPDIRECT3DDEVICE9 pDevice,
 DLLインジェクションにより作成したDLLをロードさせると、図では確認しにくいが、飛行機のテクスチャが一色に染まった。
 
 <div style="text-align: center;">
-    <img src="https://i.imgur.com/IMz5xoT.png
-" width="70%"></img>
-    <p>[6]EndSceneのフックによる文字列の描画</p>
+    <img src="https://i.imgur.com/IMz5xoT.png" width="70%"></img>
+    <p>[6]DIPのフックによるテクスチャの変更</p>
 </div>
 
 ## 不正対策
