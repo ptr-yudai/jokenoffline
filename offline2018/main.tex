@@ -109,7 +109,7 @@ struct dirent
   ファイルからデータを読む処理を例に考えてみよう．
   まず，一般的にユーザーアプリケーションはring3と呼ばれる最も権限の少ない領域に所属している．
   したがって，ハードディスクからファイルを読もうとしても，デバイスにアクセスする権限がない．
-  次に，いろんなアプリケーションがファイルをディスクから読む処理を書いてしまうと，プログラマーからすれば非常に面倒である．
+  また，いろんなアプリケーションがファイルをディスクから読む処理を書いてしまうと，プログラマーからすれば非常に面倒である．
   このような観点から，OSにはシステムコールという機能が存在する．
   OSはファイルの読み書きやメモリの確保などの，よく使われる機能や権限を要する機能をシステムコールとしてユーザーアプリケーションに提供する．
   ユーザーアプリケーションは番号や引数など必要な情報を渡してシステムコールを呼び出せば，OSカーネル側でその処理を完了してくれる．
@@ -573,12 +573,14 @@ Makefile  Module.symvers  modevil.c  modevil.ko  modevil.mod.c  modevil.mod.o  m
     https://stackoverflow.com/questions/31396090/kernel-sys-call-table-address-does-not-match-address-specified-in-system-map
   \bibitem{b_e} ``Syscall Hijacking: Dynamically obtain syscall table address (kernel 2.6.x)'', (2018/02/20)\\
     https://memset.wordpress.com/2011/01/20/syscall-hijacking-dynamically-obtain-syscall-table-address-kernel-2-6-x/
+  \bibitem{b_1} ``Passing Command Line Arguments to a Module'', (2018/02/20)\\
+    http://www.tldp.org/LDP/lkmpg/2.6/html/x323.html
   \bibitem{b_f} Linuxソースコード from Bootlin\\
     https://elixir.bootlin.com/linux/v4.9/source
   \end{thebibliography}
 \end{document}
 
 % 
-% http://www.tldp.org/LDP/lkmpg/2.6/html/x323.html
+% 
 % 
 % 
